@@ -1,0 +1,73 @@
+#cloud-config
+system_info:
+  default_user:
+    name: ${vm_admin}
+    
+#
+# Wait for azure disks to be mounted then continue
+#
+bootcmd:
+  - while [ `find /dev/disk/azure/scsi1/ -type l | wc -l` -lt 4 ]; do sleep 5; done
+
+#
+# First we'll update the repo and then update the OS.
+#
+package_update: true
+package_upgrade: true
+
+#
+# Install packages
+#
+packages:
+  - nfs-kernel-server
+
+#
+# Create mount directories
+#
+runcmd:
+  #
+  # Create /export directory with the correct owner/permissions
+  #
+  - mkdir /export
+  - chown nobody:nogroup /export -R
+  - chmod -R 0777 /export
+  #
+  # Update systemctl services
+  #
+  - systemctl enable nfs-kernel-server
+  - systemctl start nfs-kernel-server
+  - systemctl enable rpc-statd
+  - systemctl start rpc-statd
+  #
+  # Create Raid5 Array
+  #
+  - pvcreate $(find /dev/disk/azure/scsi1/ -type l | xargs)
+  - vgcreate data-vg01 $(find /dev/disk/azure/scsi1/ -type l | xargs)
+  - lvcreate --type raid5 --extents 100%FREE --stripes 3 --name data-lv01 data-vg01
+  - mkfs -t ext4 /dev/data-vg01/data-lv01
+  #
+  # Update /etc/fstab
+  #
+  - device=`lsblk -r | grep lvm | cut -d " " -f1 | grep -v "_"`
+  - mntDir='/export'
+  - deviceUUID=`sudo blkid /dev/mapper/$device | sed -r 's/.*UUID="([^"]*).*"/\1/g'`
+  - echo "UUID=$deviceUUID $mntDir auto defaults,acl,nofail 0 2" | sudo tee -a /etc/fstab > /dev/null
+  - mount -a
+  #
+  # Update /etc/exports - NOTE: The CIDR provided works for the whole VPC
+  #
+  - if [ "${aks_cidr_block}" != "${misc_cidr_block}" ]
+  - then
+  -   echo "/         ${aks_cidr_block}(ro,fsid=0)" >> /etc/exports
+  -   echo "/         ${misc_cidr_block}(ro,fsid=0)" >> /etc/exports
+  -   echo "/export   ${aks_cidr_block}(rw,no_root_squash,async,insecure,crossmnt,no_subtree_check)" >> /etc/exports
+  -   echo "/export   ${misc_cidr_block}(rw,no_root_squash,async,insecure,crossmnt,no_subtree_check)" >> /etc/exports
+  - else
+  -   echo "/         ${aks_cidr_block}(ro,fsid=0)" >> /etc/exports
+  -   echo "/export   ${aks_cidr_block}(rw,no_root_squash,async,insecure,crossmnt,no_subtree_check)" >> /etc/exports
+  - fi
+  #
+  # Restart nfs-server service
+  #
+  - exportfs -a
+  - systemctl restart nfs-kernel-server
